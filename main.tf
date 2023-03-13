@@ -1,3 +1,8 @@
+locals {
+  timestamp           = timestamp()
+  timestamp_sanitized = replace(local.timestamp, "/[- TZ:]/", "")
+}
+
 variable "aws_region" {
   type    = string
   default = "us-east-1"
@@ -18,11 +23,6 @@ variable "queue_name" {
   default = "s3-object-queue"
 }
 
-variable "vpc_id" {
-  type    = string
-  default = "vpc-c8b374b5"
-}
-
 variable "container_name" {
   type    = string
   default = "demo"
@@ -30,7 +30,42 @@ variable "container_name" {
 
 variable "container_image" {
   type    = string
-  default = "public.ecr.aws/v2k0k1b1/demo:latest"
+  default = "public.ecr.aws/v2k0k1b1/demo:dotnet"
+}
+
+resource "aws_default_vpc" "default_vpc" {
+  tags = {
+    Name = "Default VPC"
+  }
+}
+
+data "aws_subnets" "subnets" {
+  filter {
+    name   = "vpc-id"
+    values = [aws_default_vpc.default_vpc.id]
+  }
+}
+
+data "archive_file" "lambda" {
+  type = "zip"
+  source {
+    content  = templatefile("lambda.tpl", { subnet_id = data.aws_subnets.subnets.ids })
+    filename = "lambda.py"
+  }
+
+  output_path = "lambda.zip"
+
+}
+
+resource "aws_lambda_function" "ecs_task_runner_lambda" {
+  filename      = "lambda.zip"
+  function_name = "ecs_task_runner"
+  role          = aws_iam_role.lambda_task_runner_role.arn
+
+  source_code_hash = data.archive_file.lambda.output_base64sha256
+
+  runtime = "python3.9"
+  handler = "lambda.lambda_handler"
 }
 
 resource "aws_ecs_cluster" "ecs_cluster" {
@@ -134,6 +169,29 @@ resource "aws_iam_role" "ecs_task_execution_role" {
   managed_policy_arns = [
     "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
   ]
+  inline_policy {
+    name = "ecs_task_execution_policy"
+    policy = jsonencode(
+      {
+        "Version" : "2008-10-17",
+        "Statement" : [
+          {
+            "Effect" : "Allow",
+            "Action" : [
+              "logs:CreateLogGroup",
+              "logs:PutLogEvents"
+            ],
+            "Resource" : "*"
+          },
+          {
+            "Effect" : "Allow",
+            "Action" : "logs:PutLogEvents",
+            "Resource" : "*"
+          }
+        ]
+      }
+    )
+  }
   assume_role_policy = jsonencode(
     {
       "Version" : "2008-10-17",
@@ -152,7 +210,7 @@ resource "aws_iam_role" "ecs_task_execution_role" {
 }
 
 resource "aws_cloudwatch_log_group" "ecs_log_group" {
-  name = "/aws/ecs/${var.service_name}"
+  name = "/aws/${var.service_name}"
 }
 
 resource "aws_ecs_task_definition" "task_definition" {
@@ -163,26 +221,43 @@ resource "aws_ecs_task_definition" "task_definition" {
   memory                   = 4096
   execution_role_arn       = aws_iam_role.ecs_task_execution_role.arn
   task_role_arn            = aws_iam_role.ecs_task_role.arn
+  runtime_platform {
+    # cpu_architecture = "ARM64"
+    cpu_architecture        = "X86_64"
+    operating_system_family = "LINUX"
+  }
 
   container_definitions = jsonencode(
     [
       {
-        "name" : "${var.container_name}",
-        "image" : "${var.container_image}",
+        "name" : var.container_name,
+        "image" : var.container_image,
         "essential" : true,
-        "logDriver" : "awslogs"
+        "logConfiguration" : {
+          "logDriver" : "awslogs",
+          "options" : {
+            "awslogs-create-group" : "true",
+            "awslogs-group" : "/aws/${var.service_name}/ecs_task",
+            "awslogs-region" : var.aws_region,
+            "awslogs-stream-prefix" : "ecs"
+          },
+          "requireAttributes" : [
+            {
+              "name" : "com.amazonaws.ecs.capability.logging-driver.awslogs"
+            },
+            {
+              "name" : "ecs.capability.execution-role-awslogs"
+            }
+          ]
+        }
       }
     ]
   )
 }
 
-data "aws_vpc" "vpc" {
-  id = var.vpc_id
-}
-
 resource "aws_security_group" "security_group" {
   name   = var.service_name
-  vpc_id = data.aws_vpc.vpc.id
+  vpc_id = aws_default_vpc.default_vpc.id
 
   egress {
     from_port = 0
@@ -195,23 +270,6 @@ resource "aws_security_group" "security_group" {
   tags = {
     Name = var.service_name
   }
-}
-
-data "archive_file" "lambda" {
-  type        = "zip"
-  source_file = "resources/lambda.py"
-  output_path = "lambda.zip"
-}
-
-resource "aws_lambda_function" "ecs_task_runner_lambda" {
-  filename      = "lambda.zip"
-  function_name = "ecs_task_runner"
-  role          = aws_iam_role.lambda_task_runner_role.arn
-
-  source_code_hash = data.archive_file.lambda.output_base64sha256
-
-  runtime = "python3.9"
-  handler = "lambda.lambda_handler"
 }
 
 resource "aws_sqs_queue" "task_runner_queue" {
@@ -232,7 +290,7 @@ resource "aws_sqs_queue_policy" "task_runner_queue_policy" {
           "Action" : [
             "SQS:SendMessage"
           ],
-          "Resource" : "${aws_sqs_queue.task_runner_queue.arn}"
+          "Resource" : aws_sqs_queue.task_runner_queue.arn
         }
       ]
     }
@@ -242,19 +300,19 @@ resource "aws_sqs_queue_policy" "task_runner_queue_policy" {
 resource "aws_lambda_event_source_mapping" "task_queue_lambda_mapping" {
   event_source_arn = aws_sqs_queue.task_runner_queue.arn
   function_name    = aws_lambda_function.ecs_task_runner_lambda.arn
-  batch_size = 1
+  batch_size       = 1
 }
 
 resource "aws_s3_bucket" "in_bucket" {
-  # bucket = "your_bucket_name"
+  bucket        = "bucket-${local.timestamp_sanitized}"
+  force_destroy = true
 }
 
 resource "aws_s3_bucket_notification" "in_bucket_notification" {
   bucket = aws_s3_bucket.in_bucket.bucket
   queue {
-    queue_arn = aws_sqs_queue.task_runner_queue.arn
-    events = ["s3:ObjectCreated:Put","s3:ObjectCreated:Post","s3:ObjectCreated:Copy"]
+    queue_arn     = aws_sqs_queue.task_runner_queue.arn
+    events        = ["s3:ObjectCreated:Put", "s3:ObjectCreated:Post", "s3:ObjectCreated:Copy"]
     filter_prefix = "in/"
   }
 }
-
